@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ArrowLeft, Play, Square, Wifi, WifiOff, Volume2, VolumeX } from 'lucide-react';
+import { KVSWebRTCClient } from '@/lib/kvs-webrtc';
 
 interface ConsumerProps {
   config: {
@@ -22,43 +23,71 @@ export default function Consumer({ config, onBack }: ConsumerProps) {
   const [error, setError] = useState<string>('');
   const [isMuted, setIsMuted] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const kvsClientRef = useRef<KVSWebRTCClient | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
 
   const startViewing = async () => {
     try {
       setConnectionStatus('connecting');
       setError('');
 
-      // In a real implementation, you would:
-      // 1. Initialize AWS KVS WebRTC client
-      // 2. Create RTCPeerConnection
-      // 3. Connect as viewer to the channel
-      // 4. Handle incoming remote stream
-      
-      // Simulated connection for demo
-      setTimeout(() => {
-        setConnectionStatus('connected');
-        setIsViewing(true);
-        
-        // Simulate remote stream (would be actual stream from AWS KVS)
+      // Initialize KVS WebRTC client as viewer (consumer)
+      kvsClientRef.current = new KVSWebRTCClient(config, 'VIEWER');
+
+      // Set up event handlers
+      kvsClientRef.current.onRemoteStream((stream) => {
+        console.log('Received remote stream');
+        remoteStreamRef.current = stream;
         if (videoRef.current) {
-          // In real implementation, this would be the remote stream
-          // videoRef.current.srcObject = remoteStream;
+          videoRef.current.srcObject = stream;
         }
-      }, 2000);
+      });
+
+      kvsClientRef.current.onConnectionStateChange((state) => {
+        console.log('Connection state:', state);
+        switch (state) {
+          case 'connected':
+            setConnectionStatus('connected');
+            setIsViewing(true);
+            break;
+          case 'failed':
+          case 'disconnected':
+            setConnectionStatus('error');
+            setIsViewing(false);
+            break;
+          case 'connecting':
+            setConnectionStatus('connecting');
+            break;
+        }
+      });
+
+      kvsClientRef.current.onError((error) => {
+        console.error('KVS WebRTC error:', error);
+        setError(`Connection error: ${error.message}`);
+        setConnectionStatus('error');
+        setIsViewing(false);
+      });
+
+      // Connect without local stream (viewer only receives)
+      await kvsClientRef.current.connect();
 
     } catch (err) {
       setConnectionStatus('error');
       setError(`Connection failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      setIsViewing(false);
     }
   };
 
   const stopViewing = () => {
     setIsViewing(false);
     setConnectionStatus('disconnected');
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
+    if (kvsClientRef.current) {
+      kvsClientRef.current.disconnect();
+      kvsClientRef.current = null;
+    }
+    if (remoteStreamRef.current) {
+      remoteStreamRef.current.getTracks().forEach(track => track.stop());
+      remoteStreamRef.current = null;
     }
     if (videoRef.current) {
       videoRef.current.srcObject = null;

@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ArrowLeft, Video, VideoOff, Wifi, WifiOff } from 'lucide-react';
+import { KVSWebRTCClient } from '@/lib/kvs-webrtc';
 
 interface ProducerProps {
   config: {
@@ -20,11 +21,31 @@ export default function Producer({ config, onBack }: ProducerProps) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
   const [error, setError] = useState<string>('');
+  const [cameraPermission, setCameraPermission] = useState<'prompt' | 'granted' | 'denied' | 'checking'>('checking');
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const kvsClientRef = useRef<KVSWebRTCClient | null>(null);
 
-  const startCamera = async () => {
+  const checkCameraPermission = async () => {
+    try {
+      const result = await navigator.permissions.query({ name: 'camera' as PermissionName });
+      setCameraPermission(result.state);
+      
+      result.addEventListener('change', () => {
+        setCameraPermission(result.state);
+      });
+      
+      return result.state;
+    } catch (err) {
+      console.log('Permission API not supported, will request directly');
+      return 'prompt';
+    }
+  };
+
+  const requestCameraPermission = async () => {
+    setCameraPermission('checking');
+    setError('');
+    
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -39,8 +60,33 @@ export default function Producer({ config, onBack }: ProducerProps) {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
+      setCameraPermission('granted');
     } catch (err) {
-      setError(`Camera access failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      if (err instanceof Error) {
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setCameraPermission('denied');
+          setError('Camera permission denied. Please enable camera access in your browser settings.');
+        } else if (err.name === 'NotFoundError') {
+          setError('No camera device found. Please connect a camera.');
+        } else {
+          setError(`Camera access failed: ${err.message}`);
+        }
+      } else {
+        setError('Camera access failed: Unknown error');
+      }
+    }
+  };
+
+  const startCamera = async () => {
+    const permission = await checkCameraPermission();
+    
+    if (permission === 'granted') {
+      await requestCameraPermission();
+    } else if (permission === 'prompt') {
+      await requestCameraPermission();
+    } else if (permission === 'denied') {
+      setCameraPermission('denied');
+      setError('Camera permission denied. Please enable camera access in your browser settings.');
     }
   };
 
@@ -59,30 +105,57 @@ export default function Producer({ config, onBack }: ProducerProps) {
       setConnectionStatus('connecting');
       setError('');
 
-      // In a real implementation, you would:
-      // 1. Initialize AWS KVS WebRTC client
-      // 2. Create RTCPeerConnection
-      // 3. Add local stream to peer connection
-      // 4. Handle signaling through AWS KVS
-      
-      // Simulated connection for demo
-      setTimeout(() => {
-        setConnectionStatus('connected');
-        setIsStreaming(true);
-      }, 2000);
+      if (!streamRef.current) {
+        setError('No camera stream available');
+        setConnectionStatus('error');
+        return;
+      }
+
+      // Initialize KVS WebRTC client as master (producer)
+      kvsClientRef.current = new KVSWebRTCClient(config, 'MASTER');
+
+      // Set up event handlers
+      kvsClientRef.current.onConnectionStateChange((state) => {
+        console.log('Connection state:', state);
+        switch (state) {
+          case 'connected':
+            setConnectionStatus('connected');
+            setIsStreaming(true);
+            break;
+          case 'failed':
+          case 'disconnected':
+            setConnectionStatus('error');
+            setIsStreaming(false);
+            break;
+          case 'connecting':
+            setConnectionStatus('connecting');
+            break;
+        }
+      });
+
+      kvsClientRef.current.onError((error) => {
+        console.error('KVS WebRTC error:', error);
+        setError(`Streaming error: ${error.message}`);
+        setConnectionStatus('error');
+        setIsStreaming(false);
+      });
+
+      // Connect with local stream
+      await kvsClientRef.current.connect(streamRef.current);
 
     } catch (err) {
       setConnectionStatus('error');
       setError(`Streaming failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      setIsStreaming(false);
     }
   };
 
   const stopStreaming = () => {
     setIsStreaming(false);
     setConnectionStatus('disconnected');
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
+    if (kvsClientRef.current) {
+      kvsClientRef.current.disconnect();
+      kvsClientRef.current = null;
     }
   };
 
@@ -92,6 +165,7 @@ export default function Producer({ config, onBack }: ProducerProps) {
       stopCamera();
       stopStreaming();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const getStatusColor = () => {
@@ -150,8 +224,39 @@ export default function Producer({ config, onBack }: ProducerProps) {
                   {!streamRef.current && (
                     <div className="absolute inset-0 flex items-center justify-center">
                       <div className="text-white text-center">
-                        <VideoOff className="w-12 h-12 mx-auto mb-2 text-gray-400" />
-                        <p>Camera not available</p>
+                        {cameraPermission === 'checking' ? (
+                          <>
+                            <div className="w-12 h-12 mx-auto mb-2 border-4 border-gray-400 border-t-white rounded-full animate-spin" />
+                            <p>Checking camera permission...</p>
+                          </>
+                        ) : cameraPermission === 'denied' ? (
+                          <>
+                            <VideoOff className="w-12 h-12 mx-auto mb-2 text-red-400" />
+                            <p className="mb-4">Camera access denied</p>
+                            <Button
+                              onClick={requestCameraPermission}
+                              className="bg-blue-600 hover:bg-blue-700"
+                            >
+                              Request Permission
+                            </Button>
+                          </>
+                        ) : cameraPermission === 'prompt' ? (
+                          <>
+                            <Video className="w-12 h-12 mx-auto mb-2 text-yellow-400" />
+                            <p className="mb-4">Camera permission required</p>
+                            <Button
+                              onClick={requestCameraPermission}
+                              className="bg-blue-600 hover:bg-blue-700"
+                            >
+                              Enable Camera
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            <VideoOff className="w-12 h-12 mx-auto mb-2 text-gray-400" />
+                            <p>Camera not available</p>
+                          </>
+                        )}
                       </div>
                     </div>
                   )}
@@ -197,6 +302,17 @@ export default function Producer({ config, onBack }: ProducerProps) {
                     <span className="text-gray-300">Status:</span>
                     <Badge className={`${getStatusColor()} text-white`}>
                       {connectionStatus}
+                    </Badge>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-300">Camera:</span>
+                    <Badge className={`${
+                      cameraPermission === 'granted' ? 'bg-green-600' :
+                      cameraPermission === 'denied' ? 'bg-red-600' :
+                      cameraPermission === 'checking' ? 'bg-yellow-600' :
+                      'bg-gray-600'
+                    } text-white`}>
+                      {cameraPermission}
                     </Badge>
                   </div>
                   <div className="flex justify-between">
