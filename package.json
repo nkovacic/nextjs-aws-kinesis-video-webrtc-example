@@ -9,6 +9,8 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@aws-sdk/client-kinesis-video": "^3.863.0",
+    "@aws-sdk/client-kinesis-video-signaling": "^3.863.0",
     "@hookform/resolvers": "^3.9.0",
     "@next/swc-wasm-nodejs": "13.5.1",
     "@radix-ui/react-accordion": "^1.2.0",
@@ -43,7 +45,6 @@
     "@types/react-dom": "18.2.7",
     "amazon-kinesis-video-streams-webrtc": "^2.4.1",
     "autoprefixer": "10.4.15",
-    "aws-sdk": "^2.1692.0",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "cmdk": "^1.0.0",
