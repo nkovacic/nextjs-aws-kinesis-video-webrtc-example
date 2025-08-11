@@ -1,4 +1,5 @@
-import AWS from 'aws-sdk';
+import { KinesisVideoClient, DescribeSignalingChannelCommand, GetSignalingChannelEndpointCommand } from '@aws-sdk/client-kinesis-video';
+import { KinesisVideoSignalingClient, GetIceServerConfigCommand } from '@aws-sdk/client-kinesis-video-signaling';
 import { SignalingClient, Role } from 'amazon-kinesis-video-streams-webrtc';
 
 export interface KVSConfig {
@@ -15,8 +16,8 @@ export interface IceServer {
 }
 
 export class KVSWebRTCClient {
-  private kinesisVideoClient: AWS.KinesisVideo;
-  private kinesisVideoSignalingClient: AWS.KinesisVideoSignalingChannels;
+  private kinesisVideoClient: KinesisVideoClient;
+  private kinesisVideoSignalingClient: KinesisVideoSignalingClient;
   private signalingClient?: SignalingClient;
   private peerConnection?: RTCPeerConnection;
   private localStream?: MediaStream;
@@ -26,27 +27,25 @@ export class KVSWebRTCClient {
   private onRemoteStreamCallback?: (stream: MediaStream) => void;
   private onConnectionStateChangeCallback?: (state: RTCPeerConnectionState) => void;
   private onErrorCallback?: (error: Error) => void;
+  private pendingICECandidates: RTCIceCandidate[] = [];
 
   constructor(config: KVSConfig, role: 'MASTER' | 'VIEWER') {
     this.config = config;
     this.role = role === 'MASTER' ? Role.MASTER : Role.VIEWER;
 
-    AWS.config.update({
+    const credentials = {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey,
+    };
+
+    this.kinesisVideoClient = new KinesisVideoClient({
       region: config.region,
-      credentials: new AWS.Credentials({
-        accessKeyId: config.accessKeyId,
-        secretAccessKey: config.secretAccessKey,
-      }),
+      credentials,
     });
 
-    this.kinesisVideoClient = new AWS.KinesisVideo({
+    this.kinesisVideoSignalingClient = new KinesisVideoSignalingClient({
       region: config.region,
-      correctClockSkew: true,
-    });
-
-    this.kinesisVideoSignalingClient = new AWS.KinesisVideoSignalingChannels({
-      region: config.region,
-      correctClockSkew: true,
+      credentials,
     });
   }
 
@@ -55,25 +54,27 @@ export class KVSWebRTCClient {
       this.localStream = localStream;
 
       // Get signaling channel ARN
-      const describeSignalingChannelResponse = await this.kinesisVideoClient
-        .describeSignalingChannel({ ChannelName: this.config.channelName })
-        .promise();
+      const describeSignalingChannelCommand = new DescribeSignalingChannelCommand({
+        ChannelName: this.config.channelName,
+      });
+      const describeSignalingChannelResponse = await this.kinesisVideoClient.send(describeSignalingChannelCommand);
 
       const channelARN = describeSignalingChannelResponse.ChannelInfo?.ChannelARN;
       if (!channelARN) {
         throw new Error('Failed to get channel ARN');
       }
 
+      console.log('Channel ARN:', channelARN);
+
       // Get signaling channel endpoints
-      const getSignalingChannelEndpointResponse = await this.kinesisVideoClient
-        .getSignalingChannelEndpoint({
-          ChannelARN: channelARN,
-          SingleMasterChannelEndpointConfiguration: {
-            Protocols: ['WSS', 'HTTPS'],
-            Role: this.role,
-          },
-        })
-        .promise();
+      const getSignalingChannelEndpointCommand = new GetSignalingChannelEndpointCommand({
+        ChannelARN: channelARN,
+        SingleMasterChannelEndpointConfiguration: {
+          Protocols: ['WSS', 'HTTPS'],
+          Role: this.role,
+        },
+      });
+      const getSignalingChannelEndpointResponse = await this.kinesisVideoClient.send(getSignalingChannelEndpointCommand);
 
       const endpointsByProtocol = getSignalingChannelEndpointResponse.ResourceEndpointList?.reduce(
         (endpoints: any, endpoint: any) => {
@@ -87,10 +88,14 @@ export class KVSWebRTCClient {
         throw new Error('Failed to get signaling endpoints');
       }
 
+      console.log('Role:', this.role === Role.MASTER ? 'MASTER' : 'VIEWER');
+      console.log('WSS Endpoint:', endpointsByProtocol.WSS);
+
       // Get ICE server configuration
-      const getIceServerConfigResponse = await this.kinesisVideoSignalingClient
-        .getIceServerConfig({ ChannelARN: channelARN })
-        .promise();
+      const getIceServerConfigCommand = new GetIceServerConfigCommand({
+        ChannelARN: channelARN,
+      });
+      const getIceServerConfigResponse = await this.kinesisVideoSignalingClient.send(getIceServerConfigCommand);
 
       const iceServers: IceServer[] = [];
       if (getIceServerConfigResponse.IceServerList) {
@@ -103,6 +108,8 @@ export class KVSWebRTCClient {
         });
       }
 
+      console.log('ICE servers configured:', iceServers.length);
+
       // Create peer connection
       this.peerConnection = new RTCPeerConnection({
         iceServers,
@@ -110,14 +117,18 @@ export class KVSWebRTCClient {
       });
 
       // Add local stream tracks to peer connection
+      // Master always adds tracks for streaming
+      // Viewer can optionally add tracks for bidirectional communication
       if (this.localStream) {
         this.localStream.getTracks().forEach(track => {
+          console.log(`${this.role === Role.MASTER ? 'Master' : 'Viewer'} adding local track:`, track.kind);
           this.peerConnection?.addTrack(track, this.localStream!);
         });
       }
 
       // Handle remote stream
       this.peerConnection.ontrack = (event) => {
+        console.log('Received remote track:', event.track.kind);
         if (!this.remoteStream) {
           this.remoteStream = new MediaStream();
         }
@@ -129,13 +140,32 @@ export class KVSWebRTCClient {
 
       // Monitor connection state
       this.peerConnection.onconnectionstatechange = () => {
-        if (this.onConnectionStateChangeCallback && this.peerConnection) {
-          this.onConnectionStateChangeCallback(this.peerConnection.connectionState);
+        if (this.peerConnection) {
+          console.log('Peer connection state:', this.peerConnection.connectionState);
+          if (this.onConnectionStateChangeCallback) {
+            this.onConnectionStateChangeCallback(this.peerConnection.connectionState);
+          }
+        }
+      };
+
+      // Monitor ICE connection state
+      this.peerConnection.oniceconnectionstatechange = () => {
+        if (this.peerConnection) {
+          console.log('ICE connection state:', this.peerConnection.iceConnectionState);
+        }
+      };
+
+      // Set up ICE candidate handling
+      this.peerConnection.onicecandidate = ({ candidate }) => {
+        if (candidate && this.signalingClient) {
+          console.log('Sending ICE candidate');
+          this.signalingClient.sendIceCandidate(candidate);
         }
       };
 
       // Create signaling client
-      this.signalingClient = new SignalingClient({
+      console.log('Creating signaling client...');
+      const signalingConfig: any = {
         channelARN,
         channelEndpoint: endpointsByProtocol.WSS,
         role: this.role,
@@ -144,69 +174,27 @@ export class KVSWebRTCClient {
           accessKeyId: this.config.accessKeyId,
           secretAccessKey: this.config.secretAccessKey,
         },
-        systemClockOffset: this.kinesisVideoClient.config.systemClockOffset,
-      });
-
-      // Handle signaling client events
-      this.signalingClient.on('open', async () => {
-        console.log('Signaling client connected');
-      });
-
-      this.signalingClient.on('sdpOffer', async (offer, remoteClientId) => {
-        if (this.role === Role.VIEWER && this.peerConnection) {
-          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await this.peerConnection.createAnswer();
-          await this.peerConnection.setLocalDescription(answer);
-          this.signalingClient?.sendSdpAnswer(answer as RTCSessionDescription, remoteClientId);
-        }
-      });
-
-      this.signalingClient.on('sdpAnswer', async (answer) => {
-        if (this.role === Role.MASTER && this.peerConnection) {
-          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-        }
-      });
-
-      this.signalingClient.on('iceCandidate', async (candidate) => {
-        if (this.peerConnection) {
-          await this.peerConnection.addIceCandidate(candidate);
-        }
-      });
-
-      this.signalingClient.on('error', (error) => {
-        console.error('Signaling client error:', error);
-        if (this.onErrorCallback) {
-          this.onErrorCallback(error);
-        }
-      });
-
-      this.signalingClient.on('close', () => {
-        console.log('Signaling client closed');
-      });
-
-      // Set up ICE candidate gathering
-      this.peerConnection.onicecandidate = ({ candidate }) => {
-        if (candidate) {
-          if (this.role === Role.MASTER) {
-            this.signalingClient?.sendIceCandidate(candidate);
-          } else {
-            this.signalingClient?.sendIceCandidate(candidate);
-          }
-        }
+        systemClockOffset: 0,
       };
 
+      // Viewer needs a clientId
+      if (this.role === Role.VIEWER) {
+        signalingConfig.clientId = `viewer-${Date.now()}-${Math.random().toString(36).substring(2)}`;
+        console.log('Viewer clientId:', signalingConfig.clientId);
+      }
+
+      this.signalingClient = new SignalingClient(signalingConfig);
+
+      // Set up signaling event handlers
+      this.setupSignalingHandlers();
+
       // Open signaling connection
+      console.log('Opening signaling connection...');
       this.signalingClient.open();
 
-      // Create and send offer if master
-      if (this.role === Role.MASTER && this.peerConnection) {
-        const offer = await this.peerConnection.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: true,
-        });
-        await this.peerConnection.setLocalDescription(offer);
-        this.signalingClient.sendSdpOffer(offer as RTCSessionDescription);
-      }
+      // Wait for connection
+      await this.waitForConnection();
+
     } catch (error) {
       console.error('Connection error:', error);
       if (this.onErrorCallback) {
@@ -214,6 +202,127 @@ export class KVSWebRTCClient {
       }
       throw error;
     }
+  }
+
+  private setupSignalingHandlers(): void {
+    if (!this.signalingClient) return;
+
+    this.signalingClient.on('open', async () => {
+      console.log('Signaling connected, role:', this.role === Role.MASTER ? 'MASTER' : 'VIEWER');
+      
+      if (this.role === Role.VIEWER) {
+        // Viewer initiates connection by sending offer
+        console.log('Viewer connected, sending offer to master...');
+        await this.createAndSendOffer();
+      }
+      // Master waits for offers from viewers
+    });
+
+    this.signalingClient.on('sdpOffer', async (offer: any, remoteClientId: string) => {
+      console.log('Received SDP offer from:', remoteClientId);
+      
+      // Master receives offers from viewers and responds with answers
+      if (this.role === Role.MASTER && this.peerConnection) {
+        try {
+          await this.peerConnection.setRemoteDescription(offer);
+          const answer = await this.peerConnection.createAnswer();
+          await this.peerConnection.setLocalDescription(answer);
+          this.signalingClient?.sendSdpAnswer(answer as RTCSessionDescription, remoteClientId);
+          console.log('Master sent SDP answer to viewer:', remoteClientId);
+          
+          // Process pending ICE candidates
+          for (const candidate of this.pendingICECandidates) {
+            await this.peerConnection.addIceCandidate(candidate);
+          }
+          this.pendingICECandidates = [];
+        } catch (error) {
+          console.error('Error handling offer:', error);
+        }
+      }
+    });
+
+    this.signalingClient.on('sdpAnswer', async (answer: any, remoteClientId: string) => {
+      console.log('Received SDP answer from:', remoteClientId || 'master');
+      
+      // Viewer receives answer from master
+      if (this.role === Role.VIEWER && this.peerConnection) {
+        try {
+          await this.peerConnection.setRemoteDescription(answer);
+          console.log('Viewer set remote description from master');
+          
+          // Process pending ICE candidates
+          for (const candidate of this.pendingICECandidates) {
+            await this.peerConnection.addIceCandidate(candidate);
+          }
+          this.pendingICECandidates = [];
+        } catch (error) {
+          console.error('Error handling answer:', error);
+        }
+      }
+    });
+
+    this.signalingClient.on('iceCandidate', async (candidate: any) => {
+      console.log('Received ICE candidate');
+      
+      if (this.peerConnection) {
+        if (!this.peerConnection.remoteDescription) {
+          this.pendingICECandidates.push(candidate);
+        } else {
+          try {
+            await this.peerConnection.addIceCandidate(candidate);
+          } catch (error) {
+            console.error('Error adding ICE candidate:', error);
+          }
+        }
+      }
+    });
+
+    this.signalingClient.on('error', (error: any) => {
+      console.error('Signaling error:', error);
+      if (this.onErrorCallback) {
+        this.onErrorCallback(error);
+      }
+    });
+
+    this.signalingClient.on('close', () => {
+      console.log('Signaling closed');
+    });
+  }
+
+  private async createAndSendOffer(): Promise<void> {
+    if (this.role !== Role.VIEWER || !this.peerConnection || !this.signalingClient) return;
+
+    try {
+      // Viewer creates offer to send to master
+      const offer = await this.peerConnection.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+      });
+      await this.peerConnection.setLocalDescription(offer);
+      this.signalingClient.sendSdpOffer(offer as RTCSessionDescription);
+      console.log('Viewer sent SDP offer to master');
+    } catch (error) {
+      console.error('Error creating/sending offer:', error);
+      if (this.onErrorCallback) {
+        this.onErrorCallback(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+  }
+
+  private waitForConnection(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Connection timeout')), 10000);
+      
+      this.signalingClient?.on('open', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      
+      this.signalingClient?.on('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
   }
 
   disconnect(): void {
